@@ -479,7 +479,12 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     )
 
     events = []
+    budget = line_budget(font_name, fontsize)
     for block in blocks:
+        # Libass only wraps between words, so a German compound longer than one line ran off
+        # both edges; we shrink the whole block until its longest word fits.
+        longest = max(len(w['word'].strip()) for w in block)
+        size_tag = f"{{\\fs{max(8, final_fontsize * budget // longest)}}}" if longest > budget else ""
         for i, word in enumerate(block):
             # Event runs until the next word starts (no flicker in gaps);
             # the last word holds until the block ends.
@@ -494,11 +499,11 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                 if uppercase:
                     text = text.upper()
                 if j == i:
-                    parts.append(f"{active_prefix}{text}{{\\r}}")
+                    parts.append(f"{active_prefix}{size_tag}{text}{{\\r}}")
                 elif reveal and j > i:
-                    parts.append(f"{{\\alpha&HFF&}}{text}{{\\r}}")
+                    parts.append(f"{size_tag}{{\\alpha&HFF&}}{text}{{\\r}}")
                 else:
-                    parts.append(text)
+                    parts.append(f"{size_tag}{text}")
 
             events.append(
                 f"Dialogue: 0,{_ass_time(ev_start)},{_ass_time(ev_end)},Default,,0,0,0,,"

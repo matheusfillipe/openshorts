@@ -6,6 +6,7 @@ import httpx
 
 import gemini_worker
 import llm_backend
+import subtitles
 import transcribe_backends
 
 
@@ -40,3 +41,14 @@ def test_vision_frames_go_to_the_vision_server_as_images(monkeypatch):
     parts = seen["body"]["messages"][1]["content"]
     assert parts[0]["image_url"]["url"] == "data:image/jpeg;base64,anBn"
     assert parts[1] == {"type": "text", "text": "pick"}
+
+
+def test_a_word_longer_than_a_line_shrinks_to_fit(tmp_path):
+    words = [{"word": " Krankenversicherungsnummer", "start": 0.0, "end": 1.0},
+             {"word": " ja", "start": 1.0, "end": 1.4}]
+    out = tmp_path / "c.ass"
+    subtitles.generate_ass({"segments": [{"start": 0.0, "end": 1.4, "words": words}]}, 0.0, 1.4, str(out),
+                           max_chars=1, fontsize=44, font_name="Anton")
+    events = [line for line in out.read_text(encoding="utf-8-sig").splitlines() if line.startswith("Dialogue")]
+    assert "\\fs" in events[0]
+    assert "\\fs" not in events[1]
