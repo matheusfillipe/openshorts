@@ -358,6 +358,21 @@ def present_in_scene(video_path, box, start_f, end_f, samples=3):
 MAX_CAMERA_RATIO = 0.40
 
 
+def screen_region(orig_w, orig_h):
+    """The part of the frame the screen band shows, as even pixel (x, y, w, h).
+
+    INSET_SCREEN_REGION ("x,y,w,h" as frame fractions) names where the slide sits in a
+    composited recording, e.g. "0.04,0.04,0.68,0.68" for a conference stream that puts the
+    camera and the event footer around the slide, so the band shows the slide alone.
+    """
+    raw = os.environ.get("INSET_SCREEN_REGION", "")
+    fx, fy, fw, fh = (float(v) for v in raw.split(",")) if raw else (0.0, 0.0, 1.0, 1.0)
+    x, y = int(fx * orig_w) // 2 * 2, int(fy * orig_h) // 2 * 2
+    w = min(int(fw * orig_w), orig_w - x) // 2 * 2
+    h = min(int(fh * orig_h), orig_h - y) // 2 * 2
+    return x, y, w, h
+
+
 def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
     """Screen on top at full width, the webcam inset below.
 
@@ -380,7 +395,10 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
     cam_h = min(cam_h, int(out_h * MAX_CAMERA_RATIO))
     cam_h -= cam_h % 2
 
-    screen_h = int(round(out_w * orig_h / float(orig_w)))
+    sx, sy, sw, sh = screen_region(orig_w, orig_h)
+    whole = (sw, sh) == (orig_w // 2 * 2, orig_h // 2 * 2)
+    screen_crop = "" if whole else f"crop=w={sw}:h={sh}:x={sx}:y={sy},"
+    screen_h = int(round(out_w * sh / float(sw)))
     screen_h -= screen_h % 2
     screen_h = max(2, min(screen_h, out_h - cam_h - 2))
 
@@ -413,7 +431,7 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
         # HEIGHT: scaling a 16:9 source to 1080 wide gives 608 tall, and there
         # is no 1920-tall crop to take out of that.
         f"[bga]{blurred_backdrop(out_w, out_h, 14)}[bg];"
-        f"[sa]scale={out_w}:{screen_h}[screen];"
+        f"[sa]{screen_crop}scale={out_w}:{screen_h}[screen];"
         f"[ca]crop=w={w}:h={h}:x={x}:y={y},scale={out_w}:{cam_h}[cam];"
         f"[bg][screen]overlay=x=0:y={filler_h // 2}[withscreen];"
         f"[withscreen][cam]overlay=x=0:y={filler_h // 2 + screen_h},"
