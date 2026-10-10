@@ -127,7 +127,11 @@ def detect_faces_full_res(frame):
     """
     import cv2
     import main as m
+    import remote_detect
 
+    if remote_detect.enabled():
+        return [{'box': [int(d['x']), int(d['y']), int(d['width']), int(d['height'])],
+                 'score': int(d['width'] * d['height'])} for d in remote_detect.faces(frame)]
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     with m.DETECT_LOCK:
@@ -382,6 +386,12 @@ def fallback_ranges(scenes, strategies, fps):
     keep the classifier's verdict.
     """
     out = []
+    # Conference recordings show the slide and the speaker's camera side by side in every shot,
+    # so a face is always found; SCREENCAST_FALLBACK=all takes every shot as the screen and lets
+    # the inset detector look for the camera in each.
+    if os.environ.get("SCREENCAST_FALLBACK") == "all":
+        return [(start.get_frames() / fps, end.get_frames() / fps, "screen", 1.0, None, True)
+                for start, end in scenes]
     for (start, end), strategy in zip(scenes, strategies):
         if strategy == 'GENERAL':
             out.append((start.get_frames() / fps, end.get_frames() / fps,
