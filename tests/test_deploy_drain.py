@@ -216,6 +216,7 @@ class TestStatusFromDisk:
         d = out / "j1"
         d.mkdir()
         (d / "vid_metadata.json").write_text(json.dumps({"shorts": [{"start": 0, "end": 1}]}))
+        (d / "vid_clip_1.mp4").write_bytes(b"x")
 
         async def go():
             async with self._client() as c:

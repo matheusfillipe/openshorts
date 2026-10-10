@@ -1055,6 +1055,10 @@ def _recover_jobs_from_disk():
                     clip['video_url'] = (
                         f"/videos/{job_id}/"
                         f"{_canonical_clip_file(job_path, base_name, i)}")
+            # A job killed mid-render leaves metadata for clips that were never written.
+            clips = [c for c in clips
+                     if os.path.isfile(os.path.join(job_path, c['video_url'].rsplit('/', 1)[-1]))]
+            gave_up = os.path.isfile(os.path.join(job_path, _GAVE_UP_FILE))
             owner = None
             owner_path = os.path.join(job_path, ".owner")
             if os.path.exists(owner_path):
@@ -1062,7 +1066,7 @@ def _recover_jobs_from_disk():
                     raw = f.read().strip()
                 owner = int(raw) if raw.isdigit() else (raw or None)
             jobs[job_id] = {
-                'status': 'completed',
+                'status': 'failed' if gave_up or not clips else 'completed',
                 'logs': _TimedLog(["♻️ Job recovered from disk after server restart."]),
                 'output_dir': job_path,
                 'user_id': owner,
@@ -1082,6 +1086,8 @@ def _recover_jobs_from_disk():
 # instead of vanish. Bounded by MAX_RESUME_ATTEMPTS so a video that reliably
 # crashes the worker can't crashloop the service.
 _RESUME_FILE = ".resume.json"
+# Left by a job that ran out of resume attempts, so recovery reports it failed.
+_GAVE_UP_FILE = ".gave_up"
 MAX_RESUME_ATTEMPTS = 2
 
 # --- Deploy handover (two instances, one disk) -------------------------------
@@ -1364,9 +1370,24 @@ def _install_drain_signal_handler():
         print(f"⚠️ Drain-on-SIGTERM unavailable ({e}); jobs will resume on restart instead.")
 
 
+_SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
+
+
+def job_settings(env):
+    """The env this job set on top of the server's own: layouts, clip count and length, captions.
+
+    A resumed job rebuilds its env from os.environ, so without these it came back with the
+    server defaults (10 clips instead of the 2 asked for, the screencast layout dropped).
+    Secrets are left out; the resume path rebuilds them.
+    """
+    return {k: v for k, v in env.items()
+            if os.environ.get(k) != v and not any(m in k.upper() for m in _SECRET_MARKERS)}
+
+
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
                            webhook_url=None, webhook_secret=None, base_url=None,
-                           partial=None, source_cap_minutes=None, skip_statics=False):
+                           partial=None, source_cap_minutes=None, skip_statics=False,
+                           settings=None):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
         with open(path, "w") as f:
@@ -1390,6 +1411,7 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "source_cap_minutes": source_cap_minutes,
                 # The probe's "statics bot-checked for this video" verdict.
                 "skip_statics": bool(skip_statics),
+                "settings": settings or {},
             }, f)
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
@@ -1457,6 +1479,7 @@ def _resume_interrupted_jobs() -> set:
             # Poison job: don't resume. Leaving its reservation out of the keep
             # set lets the orphan sweep refund it, and the user can retry by hand.
             print(f"🛑 Job {job_id} exceeded {MAX_RESUME_ATTEMPTS} resume attempts — giving up.")
+            open(os.path.join(job_path, _GAVE_UP_FILE), "w").close()
             _clear_resume_manifest(job_id)
             if reservation_id:
                 keep_reservations.discard(str(reservation_id))  # let the sweep refund it
@@ -1465,6 +1488,7 @@ def _resume_interrupted_jobs() -> set:
         # Rebuild env from scratch — the manifest holds no secrets. Managed
         # (cloud) jobs get the server key; self-host falls back to its env key.
         env = child_env()
+        env.update(m.get("settings") or {})
         try:
             from cloud import proxy_ledger as _pl
             if BILLING_ENABLED and _pl.budget_exceeded_sync():
@@ -3404,7 +3428,8 @@ async def process_endpoint(
                            watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
                            base_url=api_base, partial=partial,
-                           source_cap_minutes=source_cap, skip_statics=skip_statics)
+                           source_cap_minutes=source_cap, skip_statics=skip_statics,
+                           settings=job_settings(jobs[job_id]['env']))
 
     _enqueue_job(job_id, priority)
 
