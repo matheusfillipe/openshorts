@@ -18,7 +18,9 @@ Invariants the consumers rely on (clip cutting, karaoke subtitles, Remotion):
   - all numerics are native Python floats (json.dump of the transcript).
   - words sorted by start, segments chronological, absolute file timestamps.
 
-TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet".
+TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet" | "openai".
+The openai backend sends the audio to an OpenAI-compatible server
+(ASR_BASE_URL, ASR_MODEL, ASR_API_KEY) and needs word timestamps from it.
 The parakeet path falls back to whisper automatically when the model errors,
 produces no usable words, or the detected language is outside its 25
 supported European languages (e.g. Japanese/Chinese/Arabic uploads).
@@ -627,6 +629,75 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
     return None
 
 
+# --- OpenAI-compatible server (LocalAI, vLLM, ...) ---------------------------
+
+# The server transcribes each chunk in one request, so we keep chunks short
+# enough for its request timeout and for models with a bounded audio window.
+ASR_CHUNK_SECONDS = int(os.environ.get("ASR_CHUNK_SECONDS", "300"))
+# We rebuild segments from words, since some servers return one segment per request.
+SEGMENT_GAP_SECONDS = 0.6
+SEGMENT_MAX_SECONDS = 12.0
+
+
+def _split_wav(wav_path, out_dir):
+    pattern = os.path.join(out_dir, "chunk_%04d.wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path, "-f", "segment",
+         "-segment_time", str(ASR_CHUNK_SECONDS), "-c", "copy", pattern],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+    return sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("chunk_"))
+
+
+def _remote_words(chunk_path, offset):
+    import httpx
+    base = os.environ["ASR_BASE_URL"].rstrip("/")
+    headers = {"Authorization": f"Bearer {os.environ.get('ASR_API_KEY', 'none')}"}
+    with open(chunk_path, "rb") as f:
+        resp = httpx.post(
+            f"{base}/audio/transcriptions",
+            headers=headers,
+            files={"file": (os.path.basename(chunk_path), f, "audio/wav")},
+            data={"model": os.environ.get("ASR_MODEL", "whisper-1"),
+                  "response_format": "verbose_json",
+                  "timestamp_granularities[]": "word"},
+            timeout=float(os.environ.get("ASR_TIMEOUT", "900")))
+    resp.raise_for_status()
+    body = resp.json()
+    words = body.get("words") or [w for s in body.get("segments") or [] for w in s.get("words") or []]
+    return [{"word": " " + (w.get("word") or w.get("text") or "").strip(),
+             "start": float(w["start"]) + offset, "end": float(w["end"]) + offset}
+            for w in words if (w.get("word") or w.get("text") or "").strip()]
+
+
+def _segments_from_words(words):
+    segments = []
+    for word in words:
+        last = segments[-1] if segments else None
+        if (last is None or word["start"] - last["end"] > SEGMENT_GAP_SECONDS
+                or word["end"] - last["start"] > SEGMENT_MAX_SECONDS):
+            last = {"start": word["start"], "end": word["end"], "words": []}
+            segments.append(last)
+        last["words"].append(word)
+        last["end"] = word["end"]
+    for segment in segments:
+        segment["text"] = "".join(w["word"] for w in segment["words"])
+    return segments
+
+
+def _transcribe_with_openai(media_path):
+    wav_path = _extract_wav(media_path)
+    try:
+        with tempfile.TemporaryDirectory(prefix="asr_chunks_") as chunk_dir:
+            words = []
+            for i, chunk in enumerate(_split_wav(wav_path, chunk_dir)):
+                words += _remote_words(chunk, i * ASR_CHUNK_SECONDS)
+    finally:
+        os.unlink(wav_path)
+    segments = _segments_from_words(words)
+    text = " ".join(s["text"].strip() for s in segments)
+    return {"text": text, "language": _detect_language(text), "segments": segments}
+
+
 # --- public entry point -----------------------------------------------------
 
 class NoAudioError(Exception):
@@ -659,6 +730,12 @@ def transcribe_media(media_path):
             "speech, so it needs a video with audio.")
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+
+    if backend == "openai":
+        transcript = _transcribe_with_openai(media_path)
+        print(f"🎙️ [ASR] openai ok: lang={transcript['language']} "
+              f"segments={len(transcript['segments'])}")
+        return transcript
 
     if backend == "parakeet":
         try:

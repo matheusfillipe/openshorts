@@ -44,6 +44,8 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 import json
 import os
 
+import llm_backend
+
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
 #
@@ -58,6 +60,8 @@ ENABLED = _MODE == "1" or SHADOW
 
 # 12 frames at 1024px wide. Both numbers are measured, not guessed: see above.
 SAMPLE_FRAMES = int(os.environ.get("LAYOUT_SAMPLE_FRAMES", "12"))
+# Small local vision models lose the thread over 12 large frames.
+VISION_FRAMES = int(os.environ.get("LAYOUT_VISION_FRAMES", "4"))
 SAMPLE_WIDTH = int(os.environ.get("LAYOUT_SAMPLE_WIDTH", "1024"))
 
 # What each decision turns on. Keys match the layout names in the prompt.
@@ -200,7 +204,7 @@ def pick(video_path, video_duration):
     if not ENABLED:
         return "none"
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key and not llm_backend.vision_active():
         return "none"
 
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
@@ -208,8 +212,6 @@ def pick(video_path, video_duration):
     try:
         # Inside the try on purpose: the contract above is that this never
         # raises, and an unimportable SDK is just one more reason to fall back.
-        from google import genai
-        from google.genai import types as genai_types
         import gemini_worker
 
         frames = sample_frames(video_path)
@@ -217,6 +219,13 @@ def pick(video_path, video_duration):
             print("   ⚠️ No readable frames — keeping the default layout.")
             return "none"
 
+        if not api_key:
+            answer = llm_backend.generate_vision_json(
+                gemini_worker.LAYOUT_CHOICE_PROMPT, frames[:VISION_FRAMES], gemini_worker.LayoutChoice)
+            return _decision(answer)
+
+        from google import genai
+        from google.genai import types as genai_types
         client = genai.Client(api_key=api_key)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
@@ -232,7 +241,10 @@ def pick(video_path, video_duration):
     except Exception as e:
         print(f"   ⚠️ Layout choice failed ({e}) — keeping the default layout.")
         return "none"
+    return _decision(answer)
 
+
+def _decision(answer):
     decision = str(answer.get("layout", "none")).strip().lower()
     if decision not in VALID:
         print(f"   ⚠️ Unknown layout '{decision}' — keeping the default layout.")

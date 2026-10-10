@@ -166,9 +166,22 @@ _DETECTOR = None
 _DETECTOR_LOCK = threading.Lock()
 
 
+def _face_boxes(detector, frame):
+    import cv2
+    import remote_detect
+    if remote_detect.enabled():
+        h, w = frame.shape[:2]
+        return [(d["x"] / w, d["y"] / h, (d["x"] + d["width"]) / w, (d["y"] + d["height"]) / h)
+                for d in remote_detect.faces(frame)]
+    result = detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    return [(b.xmin, b.ymin, b.xmin + b.width, b.ymin + b.height)
+            for b in (d.location_data.relative_bounding_box for d in result.detections or [])]
+
+
 def _detector():
     global _DETECTOR
-    if _DETECTOR is None:
+    import remote_detect
+    if _DETECTOR is None and not remote_detect.enabled():
         import mediapipe as mp
         # model_selection=1: the full-range model, so the small faces of a
         # GENERAL (blurred-backdrop) layout are found too.
@@ -210,13 +223,7 @@ def detect_faces(video_path, window_start=0.0, window_end=None, samples=SAMPLES)
                 h, w = frame.shape[:2]
                 if w > 720:
                     frame = cv2.resize(frame, (720, int(h * 720 / w)))
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = detector.process(rgb)
-                boxes = []
-                for d in result.detections or []:
-                    b = d.location_data.relative_bounding_box
-                    boxes.append((b.xmin, b.ymin, b.xmin + b.width, b.ymin + b.height))
-                frames.append(boxes)
+                frames.append(_face_boxes(detector, frame))
         return frames or None
     except Exception as e:
         print(f"⚠️ Hook placement: face detection failed ({type(e).__name__}: {e})")

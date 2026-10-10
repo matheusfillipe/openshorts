@@ -6,8 +6,11 @@ Ollama, LM Studio, vLLM, llama.cpp's server, LocalAI and OpenRouter all speak
 ``main.get_viral_clips`` go here instead of Gemini, so a self-hosted install
 can run the whole pipeline without a Google key.
 
+With ``VISION_BASE_URL`` (and ``VISION_MODEL``, ``VISION_API_KEY``) set, the
+layout picker sends its frames to that OpenAI-compatible vision model instead.
+
 What stays on Gemini, because it needs a model that can look at frames or a
-video file: the layout picker (``layout_picker.py``), the on-screen content
+video file: the layout picker without VISION_BASE_URL, the on-screen content
 detector (``screencast_layout.py``) and the silent-video path
 (``main.get_visual_clips``). Without a Gemini key those degrade the way they
 already did: the first two return "none", the third fails the job with a clear
@@ -23,6 +26,7 @@ so ``main.py`` sees one shape regardless of provider.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 from typing import Optional, Tuple, Type
@@ -71,11 +75,25 @@ def _timeout() -> float:
         return DEFAULT_TIMEOUT
 
 
-def _headers() -> dict:
+def _headers(key_env: str = "LLM_API_KEY") -> dict:
     # Ollama ignores the key but the OpenAI client convention (and vLLM with
     # --api-key) wants the header present; "ollama" is the documented placeholder.
-    key = (os.environ.get("LLM_API_KEY") or "ollama").strip()
+    key = (os.environ.get(key_env) or "ollama").strip()
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def vision_active() -> bool:
+    """True when frame-reading steps (layout picker) should call VISION_BASE_URL."""
+    return bool(os.environ.get("VISION_BASE_URL"))
+
+
+def generate_vision_json(prompt: str, images: list, schema: Type[BaseModel]) -> dict:
+    """``generate_json`` with JPEG frames, on the VISION_* server and model."""
+    parsed, _cost = generate_json(
+        prompt, schema, model=os.environ.get("VISION_MODEL") or model_name(), images=images,
+        url=f"{os.environ['VISION_BASE_URL'].rstrip('/')}/chat/completions",
+        key_env="VISION_API_KEY")
+    return parsed
 
 
 def _client(**kwargs) -> httpx.Client:
@@ -100,6 +118,7 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
 
 
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
+                  images=(), url: Optional[str] = None, key_env: str = "LLM_API_KEY",
                   ) -> Tuple[dict, Optional[dict]]:
     """One chat completion that must come back as JSON matching ``schema``.
 
@@ -110,11 +129,14 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     """
     import gemini_worker  # local import: keeps this module free of the google SDK
 
-    url = f"{base_url()}/chat/completions"
+    url = url or f"{base_url()}/chat/completions"
     model = model or model_name()
+    content = [{"type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpg).decode()}}
+               for jpg in images] + [{"type": "text", "text": prompt}] if images else prompt
     messages = [
         {"role": "system", "content": "You answer with a single JSON object and nothing else."},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": content},
     ]
     last_rejection: Optional[str] = None
     with _client() as client:
@@ -122,7 +144,7 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
             body = {"model": model, "messages": messages, "temperature": 0.2, "stream": False}
             if fmt is not None:
                 body["response_format"] = fmt
-            resp = client.post(url, json=body, headers=_headers())
+            resp = client.post(url, json=body, headers=_headers(key_env))
             if fmt is not None and _is_format_rejection(resp):
                 # The server does not know this response_format flavour; the
                 # next loop iteration asks for a looser one.

@@ -11,14 +11,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
 import os
 import math
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
-import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
 from google.genai import types as genai_types
@@ -28,6 +25,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import remote_detect
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
@@ -88,12 +86,16 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 # Load the YOLO model once (Keep for backup or scene analysis if needed)
 # YOLO_MODEL_PATH lets deployments point at a pre-downloaded weights file so a
 # volume mounted over the workdir doesn't trigger a re-download at startup.
-model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
-
-# --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# With a detection server (remote_detect) the image ships neither library.
+if remote_detect.enabled():
+    model = face_detection = None
+else:
+    from ultralytics import YOLO
+    import mediapipe as mp
+    model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+    # --- MediaPipe Setup ---
+    # Use standard Face Detection (BlazeFace) for speed
+    face_detection = mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -437,7 +439,12 @@ def detect_face_candidates(frame):
     MediaPipe's relative coords make the mapping exact).
     """
     height, width, _ = frame.shape
-    small, _scale = _detection_frame(frame)
+    small, scale = _detection_frame(frame)
+    if remote_detect.enabled():
+        return [{'box': [int(d['x'] * scale), int(d['y'] * scale),
+                         int(d['width'] * scale), int(d['height'] * scale)],
+                 'score': int(d['width'] * d['height'] * scale * scale)}
+                for d in remote_detect.faces(small)]
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
     with DETECT_LOCK:
         results = face_detection.process(rgb_frame)
@@ -468,31 +475,31 @@ def detect_person_yolo(frame):
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
     small, scale = _detection_frame(frame)
-    # Use the globally loaded model
-    with DETECT_LOCK:
-        results = model(small, verbose=False, classes=[0]) # class 0 is person
-
-    if not results:
-        return None
+    if remote_detect.enabled():
+        corners = [(d['x'], d['y'], d['x'] + d['width'], d['y'] + d['height'])
+                   for d in remote_detect.people(small)]
+    else:
+        # Use the globally loaded model
+        with DETECT_LOCK:
+            results = model(small, verbose=False, classes=[0]) # class 0 is person
+        corners = [box.xyxy[0] for result in results or [] for box in result.boxes]
 
     best_box = None
     max_area = 0
 
-    for result in results:
-        boxes = result.boxes
-        for box in boxes:
-            x1, y1, x2, y2 = [int(i * scale) for i in box.xyxy[0]]
-            w = x2 - x1
-            h = y2 - y1
-            area = w * h
-            
-            if area > max_area:
-                max_area = area
-                # Focus on the top 40% of the person (head/chest) for framing
-                # This approximates where the face is if we can't detect it directly
-                face_h = int(h * 0.4)
-                best_box = [x1, y1, w, face_h]
-                
+    for corner in corners:
+        x1, y1, x2, y2 = [int(i * scale) for i in corner]
+        w = x2 - x1
+        h = y2 - y1
+        area = w * h
+
+        if area > max_area:
+            max_area = area
+            # Focus on the top 40% of the person (head/chest) for framing
+            # This approximates where the face is if we can't detect it directly
+            face_h = int(h * 0.4)
+            best_box = [x1, y1, w, face_h]
+
     return best_box
 
 def create_general_frame(frame, output_width, output_height):

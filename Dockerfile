@@ -14,7 +14,16 @@ COPY requirements.txt requirements-billing.txt ./
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# LOCAL_MODELS=0 leaves out the in-process ML stack for deployments that send
+# ASR, detection and vision to a model server (TRANSCRIBE_BACKEND=openai,
+# DETECT_BASE_URL, VISION_BASE_URL, SCENE_ENGINE=pyscenedetect).
+ARG LOCAL_MODELS=1
+RUN if [ "$LOCAL_MODELS" = "1" ]; then \
+      pip install --no-cache-dir -r requirements.txt; \
+    else \
+      grep -v -E '^(torch|torchvision|ultralytics|transnetv2-pytorch|mediapipe|faster-whisper)==' requirements.txt > requirements-remote.txt \
+      && pip install --no-cache-dir -r requirements-remote.txt opencv-python-headless numpy; \
+    fi
 # Cloud (paid mode) deps: installed always so one image serves both modes; they
 # are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
 RUN pip install --no-cache-dir -r requirements-billing.txt
@@ -108,7 +117,8 @@ RUN chown -R appuser:appuser /app /tmp/Ultralytics
 USER appuser
 
 # Pre-download YOLO model on build (now running as appuser)
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+ARG LOCAL_MODELS=1
+RUN if [ "$LOCAL_MODELS" = "1" ]; then python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"; fi
 
 # Expose FastAPI port
 EXPOSE 8000
